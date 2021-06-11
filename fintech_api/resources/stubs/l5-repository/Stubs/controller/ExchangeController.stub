@@ -1,0 +1,332 @@
+<?php
+
+$NAMESPACE$
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use $APPNAME$Http\Requests\$DUMMYCLASS$CreateRequest;
+use $APPNAME$Http\Requests\$DUMMYCLASS$UpdateRequest;
+use $APPNAME$Http\Responses\$DUMMYCLASS$CreateResponse;
+use $APPNAME$Http\Responses\$DUMMYCLASS$UpdateResponse;
+use $APPNAME$Exceptions\$DUMMYCLASS$ExceptionCode as ExceptionCode;
+use App\Exceptions\Exchange\ServiceExceptionCode;
+use App\Libraries\Instances\Router\Janitor;
+use App\Repositories\Receipt\OperateRepository;
+use TokenAuth;
+use Carbon;
+use StorageSignature;
+use Cache;
+use Validator;
+use DB;
+use App\Entities\Member\Auth;
+use App\Entities\Account\Gold;
+
+/**
+ * @group
+ *
+ * Third Service - $SERVICENAME$
+ *
+ * @package $NAMESPACE$
+ */
+class $CONTROLLER$Controller extends Controller
+{
+    /**
+     * @var OperateRepository
+     */
+    protected $repository;
+
+    /**
+     * $CONTROLLER$Controller constructor.
+     *
+     * @param OperateRepository $repository
+     */
+    public function __construct(OperateRepository $repository)
+    {
+        $this->repository = $repository;
+        /* Check the service */
+        if (! Janitor::isAllowed($this, 'exchange')) {
+            throw new ServiceExceptionCode(ServiceExceptionCode::UNAVAILABLE_SERVICE);
+        }
+        /* Check the service ip */
+        $ip = request()->ip();
+        if (count($this->getServiceBindIps()) > 0 && ! in_array($ip, $this->getServiceBindIps())) {
+            throw new ServiceExceptionCode(ServiceExceptionCode::UNAUTHORIZED_IP, ['%ip%' => $ip], ['%ip%' => $ip]);
+        }
+    }
+
+    /**
+     * Requester ip restriction list.
+     *
+     * @return array
+     */
+    private function getServiceBindIps(): array
+    {
+        return [
+            // You can customize the serviceable IPs
+        ];
+    }
+
+    /**
+     * Billing Page
+     *
+     * Use payment authorization to the transaction page.
+     *
+     * ### Response HTML Page
+     *
+     * @param  string $code
+     * @param  $CLASS$CreateRequest $request
+     * @param  $CLASS$CreateResponse $response
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function billing($code, $CLASS$CreateRequest $request, $CLASS$CreateResponse $response)
+    {
+        /** Auth code */
+        $data = StorageSignature::get($code);
+        /* Check signature user */
+        if (isset($data['client'], $data['app_id'], $data['model'], $data['id'], $data['amount'], $data['type']) && TokenAuth::model() !== $data['model'] && ($guard = TokenAuth::getAuthGuard($data['model'])) && $guard === TokenAuth::getAuthGuard(Auth::class)) {
+            /* Cache forget */
+            StorageSignature::forget($code);
+            /* Get the billing type */
+            $type = $data['type'];
+            /* Get the billingables */
+            $billingables = config('exchange.billingables');
+            /* Check billing type */
+            if (! isset($billingables[$type])) {
+                throw new ExceptionCode(ExceptionCode::BILLING_AUTH_FAIL);
+            }
+            /* Get the provider */
+            $exchange = $billingables[$type];
+            /* Check provider type */
+            if (Janitor::getGuestType($this) !== $exchange) {
+                throw new ExceptionCode(ExceptionCode::BILLING_AUTH_FAIL);
+            }
+
+            $config = Janitor::getGuestData($exchange);
+        
+            $minAmount = (isset($config['billing_min_amount']) && is_array($config['billing_min_amount']) ? $config['billing_min_amount'] : []);
+                   
+            $maxAmount = (isset($config['billing_max_amount']) && is_array($config['billing_max_amount']) ? $config['billing_max_amount'] : []);
+            /* Validator amount */
+            try {
+                Validator::make(['amount' => $data['amount']], ['amount' => 'required|amount_verifier:' . $minAmount[$type] . ',' . $maxAmount[$type]])->validate();
+            } catch (\Throwable $e) {
+                if ($e instanceof ValidationException) {
+                    throw new ExceptionCode(ExceptionCode::BILLING_AUTH_FAIL);
+                }
+                throw $e;
+            }
+            /* Get the user */
+            $expires = Carbon::now()->addMinutes(TokenAuth::getTTL($data['model']) ?: config('jwt.ttl', 60));
+            $user = Cache::remember(TokenAuth::getCacheKey($data['id'], $guard), $expires, function () use ($data) {
+                return app($data['model'])->find($data['id']);
+            });
+            /* User to billing */
+            if ($user) {
+
+                $user->verifyHoldStatusOnFail();
+
+                $client = $data['client'];
+
+                $appId = $data['app_id'];
+
+                $amount = $data['amount'];
+
+                $note = [
+                    'app_id' => $appId,
+                    'provider' => Janitor::getGuestType($this),
+                    'amount' => $amount,
+                ];
+
+                $order = $user->submitReceipt('billing', [
+                    'label' => $type,
+                    'content' => 'Billing request.',
+                    'note' => $note
+                ]);
+
+                /* Logic function */
+                
+                $message = 'Currently unavailable.';
+
+                throw new ServiceExceptionCode(ServiceExceptionCode::BILLING_TO_PAYMENT_FAIL, ['%message%' => $message], ['%message%' => $message]);
+            }
+        }
+        throw new ServiceExceptionCode(ServiceExceptionCode::BILLING_AUTH_FAIL);
+    }
+
+    /**
+     * Payment
+     *
+     * Payment notification callback.
+     *
+     * ### Response Body
+     *
+     * success : true
+     *
+     * @bodyParam order STR required Recharge order serial id Example: {order}
+     *
+     * @response
+     * {
+     *    "success": true
+     * }
+     *
+     * @param  $CLASS$CreateRequest $request
+     * @param  $CLASS$CreateResponse $response
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function payment($CLASS$CreateRequest $request, $CLASS$CreateResponse $response)
+    {
+        try {
+            /* Get input */
+            $data = $request->only([
+                'order',
+            ]); 
+
+            /* Ckeck input */
+            Validator::make($data, [
+                'order' => 'required',
+            ])->validate();
+
+            // DB Transaction begin
+            DB::beginTransaction();
+
+            $order = $this->repository->pickOrderMainSerial($data['order']);
+
+            $order = $order::where('id', $order->id)->lockForUpdate()->first();
+
+            /* Check order type */
+            if ($order->formdefine_type === 'billing') {
+                /* Check order status */  
+                if ($order->status === 'billing') {
+
+                    $user = $order->sourceable_type::find($order->sourceable_id)
+
+                    $note = $order->memo['note'];
+
+                    if (true) {
+                        $user->submitReceipt('payment', [
+                            'label' => $order->memo['label'],
+                            'content' => 'Notify to payment.',
+                            'note' => $note
+                        ], $order);
+                    } else {
+                        $user->submitReceipt('interrupt', [
+                            'label' => $order->memo['label'],
+                            'content' => 'Payment interrupted.',
+                            'note' => $note
+                        ], $order);
+                    }
+                } else {
+                    throw new ServiceExceptionCode(ServiceExceptionCode::INVALID_ORDER_STATUS);
+                }
+            } else {
+                throw new ServiceExceptionCode(ServiceExceptionCode::ORDER_TYPE_WRONG);
+            }
+            
+            DB::commit();
+            
+        } catch (\Throwable $e) {
+            DB::rollback();
+        }
+
+        return $response->success();
+    }
+
+    /**
+     * Deposit
+     *
+     * Deposit notification callback.
+     *
+     * ### Response Body
+     *
+     * success : true
+     *
+     * @bodyParam order STR required Recharge order serial id Example: {order}
+     *
+     * @response
+     * {
+     *    "success": true
+     * }
+     *
+     * @param  $CLASS$CreateRequest $request
+     * @param  $CLASS$CreateResponse $response
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function deposit($CLASS$CreateRequest $request, $CLASS$CreateResponse $response)
+    {
+        try {
+            /* Get input */
+            $data = $request->only([
+                'order',
+            ]); 
+
+            /* Ckeck input */
+            Validator::make($data, [
+                'order' => 'required',
+            ])->validate();
+
+            // DB Transaction begin
+            DB::beginTransaction();
+
+            $order = $this->repository->pickOrderMainSerial($data['order']);
+
+            $order = $order::where('id', $order->id)->lockForUpdate()->first();
+            /* Check order type */
+            if ($order->formdefine_type === 'billing') {
+                /* Check order status */  
+                if ($order->status === 'payment') {
+
+                    $user = $order->sourceable_type::find($order->sourceable_id);
+
+                    $note = $order->memo['note'];
+
+                    if (true) {
+                        $user->submitReceipt('deposit', [
+                            'label' => $order->memo['label'],
+                            'content' => 'Deposit finish.',
+                            'note' => $note
+                        ], $order);
+
+                        $account = $user->tradeAccount(Gold::class);
+
+                        $account = $account->where('id', $account->id)->lockForUpdate()->first();
+
+                        $target = TokenAuth::model()::find(app(TokenAuth::model())->asPrimaryId($note['app_id']));
+
+                        $trade = $account->beginTradeAmount($target);
+                        // Amount of income by trade
+                        $trade->amountOfIncome($note['amount'], [
+                            'label' => $order->memo['label'],
+                            'content' => 'Income deposit.',
+                            'note' => [
+                                'provider' => $note['provider'],
+                                'receipt' => $order->order
+                            ]
+                        ]);
+                        // Transaction notification from system
+                        $trade->tradeNotify();
+                    } else {
+                        $user->submitReceipt('interrupt', [
+                            'label' => $order->memo['label'],
+                            'content' => 'Deposit interrupted.',
+                            'note' => $note
+                        ], $order);
+                    }
+                } else {
+                    throw new ServiceExceptionCode(ServiceExceptionCode::INVALID_ORDER_STATUS);
+                }
+            } else {
+                throw new ServiceExceptionCode(ServiceExceptionCode::ORDER_TYPE_WRONG);
+            }
+            
+            DB::commit();
+
+        } catch (\Throwable $e) {
+            DB::rollback();
+        }
+
+        return $response->success();
+    }
+}
